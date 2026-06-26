@@ -1,5 +1,6 @@
 __version__ = "0.1.0a0"
 
+from . import call_limit
 from . import order
 from . import user_inventory
 from . import catalog_item

@@ -3,6 +3,7 @@ import string as _string
 from typing import Any
 
 from . import auth as _auth
+from . import call_limit as _call_limit
 from . import helper as _helper
 from . import url as _url
 
@@ -43,5 +44,9 @@ def method(
 ) -> Any:
   preq = request(request_method, uri, **kwargs)
   session = session or requests.Session()
+
+  # Count every dispatched call
+  _call_limit.record()
+  
   resp = session.send(preq)
   return resp.json()
