@@ -17,7 +17,7 @@ import pathlib as _pathlib
 import tempfile as _tempfile
 
 
-DAILY_LIMIT = 4000
+DAILY_LIMIT = 5000
 
 
 class CallLimitReached(RuntimeError):
