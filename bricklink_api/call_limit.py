@@ -20,6 +20,14 @@ import tempfile as _tempfile
 DAILY_LIMIT = 4000
 
 
+class CallLimitReached(RuntimeError):
+  """Raised when recording a call would push usage past the daily limit.
+
+  Acts as the client-side lock: once today's count reaches ``limit``, further
+  calls are refused rather than silently exceeding BrickLink's quota.
+  """
+
+
 # -- Reset timezone ----------------------------------------------------------
 # Prefer the stdlib database (Python >= 3.9); fall back to a hand-rolled US
 # Eastern tzinfo so the daily rollover stays correct on 3.6 - 3.8 without an
@@ -132,8 +140,15 @@ class CallTracker:
     return state
 
   def record(self, n: int = 1) -> int:
-    # Add n to today's count, persist it, and return the new count.
+    # Add n to today's count, persist it, and return the new count.  Refuses
+    # (raising CallLimitReached) if the call would take usage past the daily
+    # limit, leaving the stored count untouched.
     state = self._current()
+    if state["count"] + n > self.limit:
+      raise CallLimitReached(
+          "BrickLink daily call limit reached: "
+          "{}/{} calls used today".format(state["count"], self.limit)
+      )
     state["count"] += n
     self._save(state)
     return state["count"]
@@ -143,7 +158,8 @@ class CallTracker:
     return self._current()["count"]
 
   def remaining(self) -> int:
-    # Calls left before the daily limit; may be negative if exceeded.
+    # Calls left before the daily limit.  The record() lock keeps this from
+    # going negative, though externally-tampered state could still read so.
     return self.limit - self.count()
 
   def reset(self) -> None:

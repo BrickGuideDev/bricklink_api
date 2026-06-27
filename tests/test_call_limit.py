@@ -11,7 +11,12 @@ import json
 import pytest
 
 from bricklink_api import call_limit
-from bricklink_api.call_limit import CallTracker, _USEastern, _first_sunday_on_or_after
+from bricklink_api.call_limit import (
+    CallLimitReached,
+    CallTracker,
+    _USEastern,
+    _first_sunday_on_or_after,
+)
 
 
 UTC = datetime.timezone.utc
@@ -62,9 +67,10 @@ def test_remaining(tracker):
   assert tracker.remaining() == tracker.limit - 10
 
 
-def test_remaining_can_go_negative(tracker):
-  tracker.record(tracker.limit + 7)
-  assert tracker.remaining() == -7
+def test_remaining_reaches_zero_at_limit(state_path):
+  t = CallTracker(limit=10, path=state_path)
+  t.record(10)
+  assert t.remaining() == 0
 
 
 def test_custom_limit(state_path):
@@ -77,6 +83,57 @@ def test_reset(tracker):
   tracker.record(25)
   tracker.reset()
   assert tracker.count() == 0
+
+
+# -- daily limit lock --------------------------------------------------------
+
+def test_record_allows_exactly_up_to_limit(state_path):
+  t = CallTracker(limit=10, path=state_path)
+  assert t.record(10) == 10
+
+
+def test_record_raises_once_limit_reached(state_path):
+  t = CallTracker(limit=10, path=state_path)
+  t.record(10)
+  with pytest.raises(CallLimitReached):
+    t.record()
+
+
+def test_blocked_call_is_not_counted(state_path):
+  t = CallTracker(limit=10, path=state_path)
+  t.record(8)
+  with pytest.raises(CallLimitReached):
+    t.record(3)  # would reach 11; refused as a whole
+  assert t.count() == 8
+
+
+def test_blocked_call_does_not_persist(state_path):
+  t = CallTracker(limit=10, path=state_path)
+  t.record(10)
+  with pytest.raises(CallLimitReached):
+    t.record()
+  # A fresh instance reading the same file still sees the limit fully used.
+  assert CallTracker(limit=10, path=state_path).remaining() == 0
+
+
+def test_limit_lock_clears_after_rollover(state_path):
+  t = CallTracker(limit=10, path=state_path)
+  _freeze_date(t, "2026-06-27")
+  t.record(10)
+  with pytest.raises(CallLimitReached):
+    t.record()
+
+  _freeze_date(t, "2026-06-28")
+  assert t.record() == 1
+
+
+def test_module_level_record_enforces_limit(state_path, monkeypatch):
+  # The shared-instance wrappers must enforce the lock too.
+  monkeypatch.setattr(call_limit, "tracker", CallTracker(limit=2, path=state_path))
+  call_limit.record()
+  call_limit.record()
+  with pytest.raises(CallLimitReached):
+    call_limit.record()
 
 
 # -- persistence -------------------------------------------------------------

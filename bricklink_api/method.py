@@ -45,8 +45,9 @@ def method(
   preq = request(request_method, uri, **kwargs)
   session = session or requests.Session()
 
-  # Count every dispatched call
+  # Count the call before dispatching; raises CallLimitReached once today's
+  # quota is used up, so we never send past the daily limit.
   _call_limit.record()
-  
+
   resp = session.send(preq)
   return resp.json()
