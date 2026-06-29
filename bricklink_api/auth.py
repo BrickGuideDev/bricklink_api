@@ -25,9 +25,9 @@ class DefaultOAuth:
   def get(cls):
     if cls._value is None:
       mydir = _pathlib.Path(__file__).parent
-      auth_json = mydir / "auth.json"
-      if auth_json.is_file():
-        with auth_json.open() as f:
+      config_json = mydir / "config.json"
+      if config_json.is_file():
+        with config_json.open() as f:
           auth_params = _json.load(f)
       cls.set(
           consumer_key = auth_params["ConsumerKey"],

@@ -1,11 +1,15 @@
 """Persistent daily tracking of BrickLink API call usage.
 
-BrickLink caps API usage at a number of requests per day (5000 at the time of
-writing) and resets the counter at midnight.  Neither the reset time nor its
-timezone are documented; BrickLink's servers run on US Eastern time, so that is
-used as the default.  BrickLink returns no remaining-quota header, so this count
-is a *client-side estimate*: it will diverge from the server if the same key is
-used elsewhere, from another machine, or via a different state file.
+BrickLink caps API usage at a number of requests per 24-hour window (5000 at the
+time of writing).  The window is *not* anchored to midnight in any fixed
+timezone: BrickLink lets you choose when your 24-hour window resets, so this
+module makes no assumption about it.  Instead the reset time is read from
+``config.json`` (key ``CallLimitResetTime``, an ``"HH:MM"`` 24-hour time in UTC)
+and the count rolls back to 0 each day when that time is crossed.
+
+BrickLink returns no remaining-quota header, so this count is a *client-side
+estimate*: it will diverge from the server if the same key is used elsewhere,
+from another machine, or via a different state file.
 
 Every call is counted regardless of what it returns (see ``method.method``).
 """
@@ -19,95 +23,76 @@ import tempfile as _tempfile
 
 DAILY_LIMIT = 5000
 
+# Default reset time (UTC) used when config.json omits ``CallLimitResetTime``.
+DEFAULT_RESET_TIME = "00:00"
+
+_UTC = _datetime.timezone.utc
+
+# config.json and the state file both live next to the package, matching the
+# existing convention.  If the package is installed read-only (e.g.
+# site-packages), point a CallTracker at a writable ``path`` instead.
+_CONFIG_PATH = _pathlib.Path(__file__).parent / "config.json"
+_STATE_PATH = _pathlib.Path(__file__).parent / "call_count.json"
+
 
 class CallLimitReached(RuntimeError):
   """Raised when recording a call would push usage past the daily limit.
 
-  Acts as the client-side lock: once today's count reaches ``limit``, further
-  calls are refused rather than silently exceeding BrickLink's quota.
+  Acts as the client-side lock: once the current window's count reaches
+  ``limit``, further calls are refused rather than silently exceeding
+  BrickLink's quota.
   """
 
 
-# -- Reset timezone ----------------------------------------------------------
-# Prefer the stdlib database (Python >= 3.9); fall back to a hand-rolled US
-# Eastern tzinfo so the daily rollover stays correct on 3.6 - 3.8 without an
-# extra dependency.  Override ``RESET_TZ`` (or pass ``tz=`` to CallTracker) if
-# you ever observe the reset happening on a different clock.
-
-_ZERO = _datetime.timedelta(0)
-
-
-def _first_sunday_on_or_after(dt):
-  # Advance dt to the next Sunday (or return it unchanged if already Sunday).
-  days_to_go = 6 - dt.weekday()  # Monday == 0 ... Sunday == 6
-  if days_to_go:
-    dt += _datetime.timedelta(days_to_go)
-  return dt
-
-
-class _USEastern(_datetime.tzinfo):
-  """US Eastern time with the post-2007 DST rule.
-
-  DST runs from 02:00 on the second Sunday of March to 02:00 on the first
-  Sunday of November.  Only the offset matters here (to map a UTC instant to
-  the right Eastern calendar date), so the ambiguous transition hours are
-  resolved by naive local comparison, which is good enough for a date.
-  """
-
-  _STD = _datetime.timedelta(hours=-5)   # EST
-  _DST = _datetime.timedelta(hours=-4)   # EDT
-
-  def utcoffset(self, dt):
-    # Offset from UTC: -4h during DST, -5h otherwise.
-    return self._DST if self._is_dst(dt) else self._STD
-
-  def dst(self, dt):
-    # The DST correction itself: 1h during DST, 0 otherwise.
-    return (self._DST - self._STD) if self._is_dst(dt) else _ZERO
-
-  def tzname(self, dt):
-    # Human-readable abbreviation for the active offset.
-    return "EDT" if self._is_dst(dt) else "EST"
-
-  def _is_dst(self, dt):
-    # True when dt falls inside the US Eastern DST window for its year.
-    if dt is None:
-      return False
-    start = _first_sunday_on_or_after(_datetime.datetime(dt.year, 3, 8, 2))
-    end = _first_sunday_on_or_after(_datetime.datetime(dt.year, 11, 1, 2))
-    naive = dt.replace(tzinfo=None)
-    return start <= naive < end
+def _parse_reset_time(value) -> _datetime.timedelta:
+  # Turn a reset time into an offset from midnight UTC.  Accepts an "HH:MM"
+  # string (UTC), a timedelta (used as-is), or None (-> midnight UTC).
+  if value is None:
+    return _datetime.timedelta(0)
+  if isinstance(value, _datetime.timedelta):
+    value_ = value
+  else:
+    hh, _, mm = str(value).strip().partition(":")
+    value_ = _datetime.timedelta(hours=int(hh), minutes=int(mm or 0))
+  if not _datetime.timedelta(0) <= value_ < _datetime.timedelta(days=1):
+    raise ValueError(
+        "reset time must fall within a day (00:00-23:59), got {!r}".format(value)
+    )
+  return value_
 
 
-try:
-  import zoneinfo as _zoneinfo
-  RESET_TZ = _zoneinfo.ZoneInfo("America/New_York")
-except (ImportError, Exception):  # noqa: B014 - ZoneInfoNotFoundError, no tzdata
-  RESET_TZ = _USEastern()
-
-
-# State lives next to the package, matching auth.json's convention.  If the
-# package is installed read-only (e.g. site-packages), point a CallTracker at a
-# writable path instead.
-_STATE_PATH = _pathlib.Path(__file__).parent / "call_count.json"
+def _read_reset_time(path=_CONFIG_PATH) -> str:
+  # Read CallLimitResetTime from config.json, defaulting when absent/unreadable.
+  try:
+    with _pathlib.Path(path).open() as f:
+      return _json.load(f).get("CallLimitResetTime", DEFAULT_RESET_TIME)
+  except (FileNotFoundError, ValueError):
+    return DEFAULT_RESET_TIME
 
 
 class CallTracker:
-  """Counts API calls made today and persists the count to a JSON file.
+  """Counts API calls made in the current window and persists the count.
 
-  The stored date is the current calendar date in ``tz``.  Reading or recording
-  on a later date rolls the count back to 0.
+  The window is a fixed 24-hour span resetting daily at ``reset_time`` (UTC).
+  The stored key is the calendar date of the window's start; reading or
+  recording in a later window rolls the count back to 0.
   """
 
-  def __init__(self, *, limit=DAILY_LIMIT, path=_STATE_PATH, tz=RESET_TZ):
-    # Configure the daily limit, state-file path, and reset timezone.
+  def __init__(self, *, limit=DAILY_LIMIT, path=_STATE_PATH, reset_time=None):
+    # Configure the daily limit, state-file path, and reset time.  When
+    # reset_time is None it is read from config.json (key CallLimitResetTime).
     self.limit = limit
     self.path = _pathlib.Path(path)
-    self.tz = tz
+    if reset_time is None:
+      reset_time = _read_reset_time()
+    self.reset_offset = _parse_reset_time(reset_time)
 
-  def _today(self) -> str:
-    # Current calendar date in the reset timezone, as an ISO string.
-    return _datetime.datetime.now(self.tz).date().isoformat()
+  def _window_key(self) -> str:
+    # ISO date identifying the current 24-hour window.  Shifting "now" back by
+    # the reset offset makes the date roll over exactly at the reset time, so
+    # each key spans one window regardless of where the reset falls.
+    now = _datetime.datetime.now(_UTC)
+    return (now - self.reset_offset).date().isoformat()
 
   def _load(self) -> dict:
     # Read persisted state; treat a missing or corrupt file as empty.
@@ -132,29 +117,29 @@ class CallTracker:
       raise
 
   def _current(self) -> dict:
-    # Loaded state, rolled over to a fresh count if the day has changed.
+    # Loaded state, rolled over to a fresh count if the window has changed.
     state = self._load()
-    today = self._today()
-    if state.get("date") != today:
-      state = {"date": today, "count": 0}
+    window = self._window_key()
+    if state.get("date") != window:
+      state = {"date": window, "count": 0}
     return state
 
   def record(self, n: int = 1) -> int:
-    # Add n to today's count, persist it, and return the new count.  Refuses
-    # (raising CallLimitReached) if the call would take usage past the daily
-    # limit, leaving the stored count untouched.
+    # Add n to this window's count, persist it, and return the new count.
+    # Refuses (raising CallLimitReached) if the call would take usage past the
+    # daily limit, leaving the stored count untouched.
     state = self._current()
     if state["count"] + n > self.limit:
       raise CallLimitReached(
           "BrickLink daily call limit reached: "
-          "{}/{} calls used today".format(state["count"], self.limit)
+          "{}/{} calls used this window".format(state["count"], self.limit)
       )
     state["count"] += n
     self._save(state)
     return state["count"]
 
   def count(self) -> int:
-    # Number of calls recorded so far today.
+    # Number of calls recorded so far in the current window.
     return self._current()["count"]
 
   def remaining(self) -> int:
@@ -163,8 +148,8 @@ class CallTracker:
     return self.limit - self.count()
 
   def reset(self) -> None:
-    # Force today's count back to 0.
-    self._save({"date": self._today(), "count": 0})
+    # Force this window's count back to 0.
+    self._save({"date": self._window_key(), "count": 0})
 
 
 # Shared default instance and module-level convenience wrappers.
@@ -177,10 +162,10 @@ def record(n: int = 1) -> int:
 
 
 def count() -> int:
-  # Calls recorded so far today on the shared default tracker.
+  # Calls recorded so far this window on the shared default tracker.
   return tracker.count()
 
 
 def remaining() -> int:
-  # Calls left today on the shared default tracker.
+  # Calls left this window on the shared default tracker.
   return tracker.remaining()

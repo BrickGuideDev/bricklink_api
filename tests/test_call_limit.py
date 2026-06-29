@@ -1,8 +1,8 @@
 """Tests for the call-counting logic in ``bricklink_api.call_limit``.
 
 These exercise the public ``CallTracker`` behaviour (record/count/remaining/
-reset, persistence, corrupt-state handling, daily rollover) plus the internal
-US Eastern timezone helpers that decide when the daily counter resets.
+reset, persistence, corrupt-state handling, window rollover) plus the
+configurable reset time that decides when the 24-hour counter resets.
 """
 
 import datetime
@@ -14,8 +14,8 @@ from bricklink_api import call_limit
 from bricklink_api.call_limit import (
     CallLimitReached,
     CallTracker,
-    _USEastern,
-    _first_sunday_on_or_after,
+    _parse_reset_time,
+    _read_reset_time,
 )
 
 
@@ -33,9 +33,9 @@ def tracker(state_path):
   return CallTracker(path=state_path)
 
 
-def _freeze_date(tracker, iso_date):
-  # Pin the tracker's notion of "today" so rollover behaviour is deterministic.
-  tracker._today = lambda: iso_date
+def _freeze_window(tracker, iso_date):
+  # Pin the tracker's notion of the current window so rollover is deterministic.
+  tracker._window_key = lambda: iso_date
 
 
 # -- record / count / remaining ---------------------------------------------
@@ -118,12 +118,12 @@ def test_blocked_call_does_not_persist(state_path):
 
 def test_limit_lock_clears_after_rollover(state_path):
   t = CallTracker(limit=10, path=state_path)
-  _freeze_date(t, "2026-06-27")
+  _freeze_window(t, "2026-06-27")
   t.record(10)
   with pytest.raises(CallLimitReached):
     t.record()
 
-  _freeze_date(t, "2026-06-28")
+  _freeze_window(t, "2026-06-28")
   assert t.record() == 1
 
 
@@ -144,7 +144,7 @@ def test_count_persists_across_instances(state_path):
 
 
 def test_state_file_contents(tracker, state_path):
-  _freeze_date(tracker, "2026-06-27")
+  _freeze_window(tracker, "2026-06-27")
   tracker.record(4)
   state = json.loads(state_path.read_text())
   assert state == {"date": "2026-06-27", "count": 4}
@@ -157,7 +157,7 @@ def test_missing_file_reads_as_zero(state_path):
 
 def test_corrupt_file_treated_as_empty(state_path):
   state_path.write_text("this is not json {{{")
-  # A corrupt file must not raise; it reads as a fresh day.
+  # A corrupt file must not raise; it reads as a fresh window.
   assert CallTracker(path=state_path).count() == 0
 
 
@@ -167,103 +167,116 @@ def test_save_leaves_no_temp_files(tracker, state_path):
   assert leftovers == []
 
 
-# -- daily rollover ----------------------------------------------------------
+# -- window rollover ---------------------------------------------------------
 
-def test_count_resets_on_new_day(tracker):
-  _freeze_date(tracker, "2026-06-27")
+def test_count_resets_on_new_window(tracker):
+  _freeze_window(tracker, "2026-06-27")
   tracker.record(9)
   assert tracker.count() == 9
 
-  _freeze_date(tracker, "2026-06-28")
+  _freeze_window(tracker, "2026-06-28")
   assert tracker.count() == 0
 
 
 def test_record_after_rollover_starts_fresh(tracker):
-  _freeze_date(tracker, "2026-06-27")
+  _freeze_window(tracker, "2026-06-27")
   tracker.record(9)
 
-  _freeze_date(tracker, "2026-06-28")
+  _freeze_window(tracker, "2026-06-28")
   assert tracker.record() == 1
 
 
-def test_no_rollover_within_same_day(tracker):
-  _freeze_date(tracker, "2026-06-27")
+def test_no_rollover_within_same_window(tracker):
+  _freeze_window(tracker, "2026-06-27")
   tracker.record(5)
   assert tracker.count() == 5
   assert tracker.count() == 5
 
 
-def test_today_uses_configured_timezone(state_path, monkeypatch):
-  # _today must report the calendar date in the tracker's tz, not local/UTC.
-  fixed = datetime.datetime(2026, 1, 15, 2, 0, tzinfo=UTC)
+# -- configurable reset time -------------------------------------------------
 
+def test_window_key_uses_utc_midnight_by_default(state_path, monkeypatch):
+  # With the default 00:00 reset, the window key is just the UTC calendar date.
+  _patch_now(monkeypatch, datetime.datetime(2026, 1, 15, 2, 0, tzinfo=UTC))
+  t = CallTracker(path=state_path, reset_time="00:00")
+  assert t._window_key() == "2026-01-15"
+
+
+def test_window_key_shifts_with_reset_time(state_path, monkeypatch):
+  # A 06:00 reset: 05:00 UTC still belongs to the window that opened at 06:00
+  # the previous day, so the window key is the previous date.
+  _patch_now(monkeypatch, datetime.datetime(2026, 1, 15, 5, 0, tzinfo=UTC))
+  t = CallTracker(path=state_path, reset_time="06:00")
+  assert t._window_key() == "2026-01-14"
+
+
+def test_window_key_rolls_at_reset_time(state_path, monkeypatch):
+  # One minute apart, straddling the 06:00 reset, lands in adjacent windows.
+  _patch_now(monkeypatch, datetime.datetime(2026, 1, 15, 5, 59, tzinfo=UTC))
+  before = CallTracker(path=state_path, reset_time="06:00")
+  assert before._window_key() == "2026-01-14"
+
+  _patch_now(monkeypatch, datetime.datetime(2026, 1, 15, 6, 0, tzinfo=UTC))
+  after = CallTracker(path=state_path, reset_time="06:00")
+  assert after._window_key() == "2026-01-15"
+
+
+def test_reset_time_read_from_config_json(state_path, tmp_path):
+  config = tmp_path / "config.json"
+  config.write_text(json.dumps({"CallLimitResetTime": "08:30"}))
+  assert _read_reset_time(config) == "08:30"
+
+
+def test_reset_time_defaults_when_absent(tmp_path):
+  config = tmp_path / "config.json"
+  config.write_text(json.dumps({"ConsumerKey": "x"}))
+  assert _read_reset_time(config) == call_limit.DEFAULT_RESET_TIME
+
+
+def test_reset_time_defaults_when_config_missing(tmp_path):
+  assert _read_reset_time(tmp_path / "nope.json") == call_limit.DEFAULT_RESET_TIME
+
+
+def test_reset_time_defaults_when_config_corrupt(tmp_path):
+  config = tmp_path / "config.json"
+  config.write_text("not json {{{")
+  assert _read_reset_time(config) == call_limit.DEFAULT_RESET_TIME
+
+
+# -- reset-time parsing ------------------------------------------------------
+
+def test_parse_reset_time_hours_and_minutes():
+  assert _parse_reset_time("06:30") == datetime.timedelta(hours=6, minutes=30)
+
+
+def test_parse_reset_time_hour_only():
+  assert _parse_reset_time("6") == datetime.timedelta(hours=6)
+
+
+def test_parse_reset_time_midnight():
+  assert _parse_reset_time("00:00") == datetime.timedelta(0)
+
+
+def test_parse_reset_time_none_is_midnight():
+  assert _parse_reset_time(None) == datetime.timedelta(0)
+
+
+def test_parse_reset_time_passes_through_timedelta():
+  td = datetime.timedelta(hours=3)
+  assert _parse_reset_time(td) == td
+
+
+@pytest.mark.parametrize("bad", ["24:00", "-01:00", "30:00"])
+def test_parse_reset_time_rejects_out_of_range(bad):
+  with pytest.raises(ValueError):
+    _parse_reset_time(bad)
+
+
+def _patch_now(monkeypatch, fixed):
+  # Replace call_limit's datetime so datetime.now(tz) returns `fixed`.
   class _FixedDatetime(datetime.datetime):
     @classmethod
     def now(cls, tz=None):
       return fixed.astimezone(tz)
 
   monkeypatch.setattr(call_limit._datetime, "datetime", _FixedDatetime)
-
-  # 02:00 UTC is still the previous day at the -05:00 Eastern offset.
-  eastern = CallTracker(path=state_path, tz=_USEastern())
-  assert eastern._today() == "2026-01-14"
-  utc_tracker = CallTracker(path=state_path, tz=UTC)
-  assert utc_tracker._today() == "2026-01-15"
-
-
-# -- US Eastern timezone helpers --------------------------------------------
-
-def test_first_sunday_on_or_after_returns_sunday_unchanged():
-  sunday = datetime.datetime(2026, 3, 8)  # a Sunday
-  assert sunday.weekday() == 6
-  assert _first_sunday_on_or_after(sunday) == sunday
-
-
-def test_first_sunday_on_or_after_advances_to_next_sunday():
-  monday = datetime.datetime(2026, 3, 2)  # a Monday
-  assert _first_sunday_on_or_after(monday) == datetime.datetime(2026, 3, 8)
-
-  saturday = datetime.datetime(2026, 3, 7)
-  assert _first_sunday_on_or_after(saturday) == datetime.datetime(2026, 3, 8)
-
-
-def test_eastern_standard_time_in_winter():
-  tz = _USEastern()
-  winter = datetime.datetime(2026, 1, 15, 12, 0)
-  assert tz.utcoffset(winter) == datetime.timedelta(hours=-5)
-  assert tz.dst(winter) == datetime.timedelta(0)
-  assert tz.tzname(winter) == "EST"
-
-
-def test_eastern_daylight_time_in_summer():
-  tz = _USEastern()
-  summer = datetime.datetime(2026, 7, 15, 12, 0)
-  assert tz.utcoffset(summer) == datetime.timedelta(hours=-4)
-  assert tz.dst(summer) == datetime.timedelta(hours=1)
-  assert tz.tzname(summer) == "EDT"
-
-
-@pytest.mark.parametrize("naive, is_dst", [
-  (datetime.datetime(2026, 3, 8, 1, 59), False),   # just before spring-forward
-  (datetime.datetime(2026, 3, 8, 2, 0), True),     # DST begins
-  (datetime.datetime(2026, 11, 1, 1, 59), True),   # just before fall-back
-  (datetime.datetime(2026, 11, 1, 2, 0), False),   # DST ends
-])
-def test_dst_transition_boundaries(naive, is_dst):
-  tz = _USEastern()
-  expected = datetime.timedelta(hours=-4 if is_dst else -5)
-  assert tz.utcoffset(naive) == expected
-
-
-def test_utcoffset_handles_none():
-  # tzinfo APIs may be probed with dt=None; must fall back to standard time.
-  tz = _USEastern()
-  assert tz.utcoffset(None) == datetime.timedelta(hours=-5)
-  assert tz.tzname(None) == "EST"
-
-
-def test_eastern_offset_maps_utc_instant_to_correct_date():
-  # 02:00 UTC in winter is 21:00 the previous day in Eastern.
-  tz = _USEastern()
-  instant = datetime.datetime(2026, 1, 15, 2, 0, tzinfo=UTC)
-  assert instant.astimezone(tz).date() == datetime.date(2026, 1, 14)

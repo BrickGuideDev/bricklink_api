@@ -14,5 +14,5 @@ pip-selfcheck.json
 pyvenv.cfg
 venv/
 
-**/auth.json
+**/config.json
 **/call_count.json
